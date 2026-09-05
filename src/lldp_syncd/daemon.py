@@ -10,11 +10,19 @@ from swsscommon.swsscommon import SonicV2Connector
 
 from sonic_syncd import SonicSyncDaemon
 from . import logger
-from .conventions import LldpPortIdSubtype, LldpChassisIdSubtype, LldpSystemCapabilitiesMap
+from .conventions import (
+    LldpPortIdSubtype,
+    LldpChassisIdSubtype,
+    LLDP_CAPABILITY_NAME_TO_BIT,
+)
 
 LLDPD_TIME_FORMAT = '%H:%M:%S'
 
 DEFAULT_UPDATE_INTERVAL = 10
+
+# IEEE 802.1AB Organizationally Specific TLV type. lldpd reports these as
+# unknown-tlvs (OUI / subtype / value) without a type field.
+LLDP_ORG_SPECIFIC_TLV_TYPE = 127
 
 # Match Front | Backplace | Management interface
 # TODO: Need to chamge to util function which can provide
@@ -56,14 +64,55 @@ def parse_time(time_str):
     return 0
 
 
+def _as_list(value):
+    """Normalize lldpd JSON that may be a dict (one item) or a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _normalize_oui(oui):
+    """Convert lldpd OUI ('00,90,69' / '00:90:69' / '009069') to '00:90:69'."""
+    if not oui:
+        return ''
+    cleaned = str(oui).replace(',', '').replace(':', '').replace('-', '').replace(' ', '')
+    if len(cleaned) != 6:
+        return str(oui)
+    return ':'.join(cleaned[i:i + 2] for i in range(0, 6, 2)).lower()
+
+
+def _hex_bytes_to_string(value):
+    """Flatten lldpd comma/colon-separated hex bytes to a contiguous hex string."""
+    if value is None:
+        return ''
+    if isinstance(value, list):
+        return ''.join(str(part).strip() for part in value)
+    return str(value).replace(',', '').replace(':', '').replace('-', '').replace(' ', '')
+
+
 class LldpSyncDaemon(SonicSyncDaemon):
     """
     This script uploads lldp information to Redis DB.
-    Required lldp counters are kept in a separate database (number 1)
-    within the same Redis instance on a switch
+
+    Neighbor and local chassis state go to APPL_DB. LLDP counters from
+    `lldpcli show statistics` go to COUNTERS_DB (LLDP_STATISTICS).
     """
     LLDP_ENTRY_TABLE = 'LLDP_ENTRY_TABLE'
     LLDP_LOC_CHASSIS_TABLE = 'LLDP_LOC_CHASSIS'
+    LLDP_STATISTICS_TABLE = 'LLDP_STATISTICS'
+    LLDP_STATISTICS_GLOBAL_KEY = 'GLOBAL'
+
+    # lldpd JSON key -> COUNTERS_DB / OpenConfig counter field
+    LLDP_STAT_FIELD_MAP = (
+        ('tx', 'frame_out'),
+        ('rx', 'frame_in'),
+        ('rx_discarded_cnt', 'frame_discard'),
+        ('rx_unrecognized_cnt', 'tlv_unknown'),
+        ('insert_cnt', 'tlv_accepted'),
+        ('ageout_cnt', 'entries_aged_out'),
+    )
 
     @unique
     class PortIdSubtypeMap(int, Enum):
@@ -148,23 +197,28 @@ class LldpSyncDaemon(SonicSyncDaemon):
         if not capability_list:
             return ""
 
-        sys_cap = 0x00
+        sys_cap = 0
         for capability in capability_list:
             try:
                 if (not enabled) or capability["enabled"]:
-                    sys_cap |= 128 >> LldpSystemCapabilitiesMap[capability["type"].lower()]
+                    cap_name = capability["type"].lower().replace(" ", "")
+                    bit = LLDP_CAPABILITY_NAME_TO_BIT[cap_name]
+                    sys_cap |= 0x8000 >> bit
             except KeyError:
                 logger.debug("Unknown capability {}".format(capability["type"]))
-        return "%0.2X 00" % sys_cap
+        return "%0.2X %0.2X" % ((sys_cap >> 8) & 0xFF, sys_cap & 0xFF)
 
     def __init__(self, update_interval=None):
         super(LldpSyncDaemon, self).__init__()
         self._update_interval = update_interval or DEFAULT_UPDATE_INTERVAL
         self.db_connector = SonicV2Connector()
         self.db_connector.connect(self.db_connector.APPL_DB)
+        self.db_connector.connect(self.db_connector.COUNTERS_DB)
 
         self.chassis_cache = {}
         self.interfaces_cache = {}
+        self.stats_cache = {}
+        self._pending_statistics = None
 
     @staticmethod
     def _scrap_output(cmd):
@@ -192,11 +246,18 @@ class LldpSyncDaemon(SonicSyncDaemon):
         logger.debug("Invoking lldpctl with: {}".format(cmd))
         cmd_local = ['/usr/sbin/lldpcli', '-f', 'json', 'show', 'chassis']
         logger.debug("Invoking lldpcli with: {}".format(cmd_local))
+        cmd_stats = ['/usr/sbin/lldpcli', '-f', 'json', 'show', 'statistics']
+        logger.debug("Invoking lldpcli with: {}".format(cmd_stats))
 
         lldp_json = self._scrap_output(cmd)
         if lldp_json is None:
             return None
         lldp_json['lldp_loc_chassis'] = self._scrap_output(cmd_local)
+        # Statistics scrape is best-effort: neighbor sync still proceeds if
+        # lldpcli show statistics fails or returns empty.
+        stats_json = self._scrap_output(cmd_stats)
+        if stats_json is not None:
+            lldp_json['lldp_statistics'] = stats_json
 
         return lldp_json
 
@@ -223,6 +284,9 @@ class LldpSyncDaemon(SonicSyncDaemon):
               lldpRemSysCapEnabled      LldpSystemCapabilitiesMap
         }
         """
+        self._pending_statistics = None
+        if isinstance(lldp_json, dict):
+            self._pending_statistics = self.parse_statistics(lldp_json.get('lldp_statistics'))
         try:
             interface_list = lldp_json['lldp'].get('interface') or []
             parsed_interfaces = defaultdict(dict)
@@ -238,7 +302,9 @@ class LldpSyncDaemon(SonicSyncDaemon):
                 if 'port' in if_attributes:
                     rem_port_keys = ('lldp_rem_port_id_subtype',
                                      'lldp_rem_port_id',
-                                     'lldp_rem_port_desc')
+                                     'lldp_rem_port_desc',
+                                     'lldp_rem_max_frame_size',
+                                     'lldp_rem_agg_port_id')
                     parsed_port = list(zip(rem_port_keys, self.parse_port(if_attributes['port'])))
                     parsed_interfaces[if_name].update(parsed_port)
 
@@ -249,11 +315,18 @@ class LldpSyncDaemon(SonicSyncDaemon):
                                         'lldp_rem_chassis_id',
                                         'lldp_rem_sys_name',
                                         'lldp_rem_sys_desc',
-                                        'lldp_rem_man_addr')
+                                        'lldp_rem_man_addr',
+                                        'lldp_rem_ttl')
                     parsed_chassis = list(zip(rem_chassis_keys,
                                          self.parse_chassis(if_attributes['chassis'])))
                     parsed_interfaces[if_name].update(parsed_chassis)
                     chassis_id = parsed_chassis[1][1]
+
+                parsed_interfaces[if_name].update({
+                    'lldp_rem_port_vlan_id': self.parse_pvid(if_attributes),
+                    'lldp_rem_custom_tlvs': self.parse_unknown_tlvs(if_attributes),
+                    'lldp_rem_med_inv_serial': self.parse_med_serial(if_attributes),
+                })
 
                 # lldpRemTimeMark           TimeFilter,
                 parsed_interfaces[if_name].update({'lldp_rem_time_mark':
@@ -275,7 +348,8 @@ class LldpSyncDaemon(SonicSyncDaemon):
                                     'lldp_loc_chassis_id',
                                     'lldp_loc_sys_name',
                                     'lldp_loc_sys_desc',
-                                    'lldp_loc_man_addr')
+                                    'lldp_loc_man_addr',
+                                    'lldp_loc_ttl')
                 parsed_chassis = dict(zip(loc_chassis_keys,
                                      self.parse_chassis(lldp_json['lldp_loc_chassis']
                                                         ['local-chassis']['chassis'])))
@@ -311,16 +385,21 @@ class LldpSyncDaemon(SonicSyncDaemon):
             mgmt_ip = attributes.get('mgmt-ip', '')
             if isinstance(mgmt_ip, list):
                 mgmt_ip = ','.join(mgmt_ip)
+            ttl = attributes.get('ttl', '')
+            if ttl is None:
+                ttl = ''
+            ttl = str(ttl)
         except (KeyError, ValueError):
             logger.exception("Could not infer system information from: {}"
                              .format(chassis_attributes))
-            chassis_id_subtype = chassis_id = sys_name = descr = mgmt_ip = ''
+            chassis_id_subtype = chassis_id = sys_name = descr = mgmt_ip = ttl = ''
 
         return (chassis_id_subtype,
                 chassis_id,
                 sys_name,
                 descr,
                 mgmt_ip,
+                ttl,
                 )
 
     def parse_port(self, port_attributes):
@@ -331,12 +410,81 @@ class LldpSyncDaemon(SonicSyncDaemon):
 
         except ValueError:
             logger.exception("Could not infer chassis subtype from: {}".format(port_attributes))
-            subtype, value = None
+            subtype, value = None, None
+
+        mfs = port_attributes.get('mfs', '')
+        if mfs is None:
+            mfs = ''
+        aggregid = port_attributes.get('aggregation', '')
+        if aggregid is None:
+            aggregid = ''
 
         return (subtype,
                 value,
                 port_attributes.get('descr', ''),
+                str(mfs),
+                str(aggregid),
                 )
+
+    def parse_pvid(self, if_attributes):
+        """Return IEEE 802.1 Port VLAN ID when the VLAN entry is marked pvid."""
+        for entry in _as_list(if_attributes.get('vlan')):
+            if not isinstance(entry, dict):
+                continue
+            pvid = entry.get('pvid')
+            if pvid is True or str(pvid).lower() == 'true':
+                vlan_id = entry.get('vlan-id', '')
+                if vlan_id is None:
+                    return ''
+                return str(vlan_id)
+        return ''
+
+    def parse_unknown_tlvs(self, if_attributes):
+        """Serialize neighbor org-specific TLVs for APPL_DB (JSON array)."""
+        unknown = if_attributes.get('unknown-tlvs')
+        if not unknown:
+            return ''
+        if isinstance(unknown, dict):
+            tlvs = unknown.get('unknown-tlv', unknown)
+        else:
+            tlvs = unknown
+        parsed = []
+        for tlv in _as_list(tlvs):
+            if not isinstance(tlv, dict):
+                continue
+            oui = _normalize_oui(tlv.get('oui', ''))
+            subtype = tlv.get('subtype', '')
+            if subtype is None:
+                subtype = ''
+            value_hex = _hex_bytes_to_string(tlv.get('value', ''))
+            if not oui and not value_hex:
+                continue
+            parsed.append({
+                'type': LLDP_ORG_SPECIFIC_TLV_TYPE,
+                'oui': oui,
+                'oui-subtype': str(subtype),
+                'value': value_hex,
+            })
+        if not parsed:
+            return ''
+        return json.dumps(parsed, separators=(',', ':'))
+
+    def parse_med_serial(self, if_attributes):
+        """LLDP-MED Inventory serial number, if the peer advertised it."""
+        med = if_attributes.get('lldp-med')
+        if isinstance(med, dict):
+            inventory = med.get('inventory')
+            if isinstance(inventory, dict) and inventory.get('serial'):
+                return str(inventory.get('serial'))
+        chassis = if_attributes.get('chassis')
+        if isinstance(chassis, dict):
+            for chassis_body in chassis.values():
+                if not isinstance(chassis_body, dict):
+                    continue
+                inventory = chassis_body.get('inventory')
+                if isinstance(inventory, dict) and inventory.get('serial'):
+                    return str(inventory.get('serial'))
+        return ''
 
     def cache_diff(self, cache, update):
         """
@@ -370,6 +518,96 @@ class LldpSyncDaemon(SonicSyncDaemon):
                 return False
 
         return True if changed_keys == 1 else False
+
+    @staticmethod
+    def _stat_value(container, key):
+        """Extract one lldpd JSON counter (string, int, or {key: value})."""
+        if not isinstance(container, dict):
+            return None
+        val = container.get(key)
+        if isinstance(val, dict):
+            inner = val.get(key)
+            if inner is None:
+                inner = val.get('value')
+            val = inner
+        if val is None or isinstance(val, bool):
+            return None
+        return str(val)
+
+    def _counters_from_container(self, container):
+        counters = {}
+        for src, dst in self.LLDP_STAT_FIELD_MAP:
+            val = self._stat_value(container, src)
+            counters[dst] = val if val is not None else '0'
+        return counters
+
+    def _sum_counters(self, entries):
+        totals = {dst: 0 for _, dst in self.LLDP_STAT_FIELD_MAP}
+        for entry in entries:
+            for dst in totals:
+                try:
+                    totals[dst] += int(entry.get(dst, 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        return {key: str(val) for key, val in totals.items()}
+
+    def parse_statistics(self, stats_json):
+        """Parse `lldpcli -f json show statistics` into COUNTERS_DB hashes."""
+        if not stats_json:
+            return None
+        lldp_root = stats_json.get('lldp', stats_json)
+        if not isinstance(lldp_root, dict):
+            return None
+
+        parsed = {}
+        interface_list = lldp_root.get('interface') or []
+        for interface in _as_list(interface_list):
+            if_name = None
+            if_attributes = None
+            if isinstance(interface, dict) and 'name' in interface and (
+                    'tx' in interface or 'rx' in interface):
+                if_name = str(interface.get('name'))
+                if_attributes = interface
+            else:
+                try:
+                    (if_name, if_attributes), = interface.items()
+                except (AttributeError, ValueError, TypeError):
+                    if not isinstance(interface_list, dict):
+                        continue
+                    if_name = interface
+                    if_attributes = interface_list.get(if_name)
+            if not if_name or not isinstance(if_attributes, dict):
+                continue
+            if re.match(SONIC_ETHERNET_RE_PATTERN, if_name) is None:
+                logger.warning("Ignoring statistics for interface '{}'".format(if_name))
+                continue
+            parsed[if_name] = self._counters_from_container(if_attributes)
+
+        summary = lldp_root.get('summary')
+        if parsed:
+            parsed[self.LLDP_STATISTICS_GLOBAL_KEY] = self._sum_counters(
+                [v for k, v in parsed.items() if k != self.LLDP_STATISTICS_GLOBAL_KEY])
+        elif isinstance(summary, dict):
+            parsed[self.LLDP_STATISTICS_GLOBAL_KEY] = self._counters_from_container(summary)
+        else:
+            return None
+        return parsed
+
+    def sync_statistics(self, parsed_stats):
+        """Write parsed LLDP counters to COUNTERS_DB LLDP_STATISTICS."""
+        if not parsed_stats:
+            return
+        logger.debug("Initiating LLDP statistics sync to COUNTERS_DB...")
+        new, changed, deleted = self.cache_diff(self.stats_cache, parsed_stats)
+        for if_name in list(new) + list(changed):
+            table_key = ':'.join([self.LLDP_STATISTICS_TABLE, if_name])
+            self.db_connector.hmset(self.db_connector.COUNTERS_DB, table_key, parsed_stats[if_name])
+            logger.debug("sync'd statistics {}: {}".format(table_key, parsed_stats[if_name]))
+        for if_name in deleted:
+            table_key = ':'.join([self.LLDP_STATISTICS_TABLE, if_name])
+            self.db_connector.delete(self.db_connector.COUNTERS_DB, table_key)
+            logger.info("Delete statistics table_key: {}".format(table_key))
+        self.stats_cache = parsed_stats
 
     def sync(self, parsed_update):
         """
@@ -430,3 +668,7 @@ class LldpSyncDaemon(SonicSyncDaemon):
             table_key = ':'.join([LldpSyncDaemon.LLDP_ENTRY_TABLE, interface])
             self.db_connector.hmset(self.db_connector.APPL_DB, table_key, parsed_update[interface])
             logger.info("Add new interface {} : {}".format(interface, parsed_update[interface]))
+
+        if self._pending_statistics is not None:
+            self.sync_statistics(self._pending_statistics)
+            self._pending_statistics = None

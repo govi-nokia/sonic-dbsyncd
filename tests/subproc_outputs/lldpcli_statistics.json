@@ -1,0 +1,39 @@
+{
+  "lldp": {
+    "interface": [
+      {
+        "eth0": {
+          "tx": { "tx": "10" },
+          "rx": { "rx": "20" },
+          "rx_discarded_cnt": { "rx_discarded_cnt": "1" },
+          "rx_unrecognized_cnt": { "rx_unrecognized_cnt": "2" },
+          "ageout_cnt": { "ageout_cnt": "3" },
+          "insert_cnt": { "insert_cnt": "4" },
+          "delete_cnt": { "delete_cnt": "5" }
+        }
+      },
+      {
+        "Ethernet0": {
+          "tx": "100",
+          "rx": "200",
+          "rx_discarded_cnt": "6",
+          "rx_unrecognized_cnt": "7",
+          "ageout_cnt": "8",
+          "insert_cnt": "9",
+          "delete_cnt": "10"
+        }
+      },
+      {
+        "docker0": {
+          "tx": "999",
+          "rx": "999",
+          "rx_discarded_cnt": "999",
+          "rx_unrecognized_cnt": "999",
+          "ageout_cnt": "999",
+          "insert_cnt": "999",
+          "delete_cnt": "999"
+        }
+      }
+    ]
+  }
+}

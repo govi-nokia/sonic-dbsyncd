@@ -54,6 +54,9 @@ class TestLldpSyncDaemon(TestCase):
         with open(os.path.join(INPUT_DIR, 'lldpctl_no_neighbors_loc_mgmt_ip.json')) as f:
             self._no_neighbors_loc_mgmt_ip = json.load(f)
 
+        with open(os.path.join(INPUT_DIR, 'lldpcli_statistics.json')) as f:
+            self._statistics = json.load(f)
+
         self.daemon = lldp_syncd.LldpSyncDaemon()
 
     def test_parse_json(self):
@@ -132,7 +135,23 @@ class TestLldpSyncDaemon(TestCase):
         db_loc_chassis_data = db.get_all(db.APPL_DB, 'LLDP_LOC_CHASSIS')
         self.assertEqual(parsed_loc_chassis, db_loc_chassis_data)
 
-    def test_remote_sys_capability_list(self):
+    def test_parse_sys_capabilities_lldpd_aliases_and_16bit(self):
+        caps = [
+            {"type": "Bridge", "enabled": True},
+            {"type": "Router", "enabled": True},
+            {"type": "Wlan", "enabled": False},
+            {"type": "Station", "enabled": False},
+            {"type": "C-VLAN", "enabled": True},
+        ]
+        # bits 2+4 -> 0x2800; Wlan bit 3 and Station bit 7 in supported
+        self.assertEqual(
+            self.daemon.parse_sys_capabilities(caps, enabled=True),
+            "28 80",
+        )
+        self.assertEqual(
+            self.daemon.parse_sys_capabilities(caps, enabled=False),
+            "39 80",
+        )
         interface_list = self._interface_only['lldp'].get('interface')
         for interface in interface_list:
             (if_name, if_attributes), = interface.items()
@@ -272,6 +291,68 @@ class TestLldpSyncDaemon(TestCase):
                 else:
                     jo[k] = db.get_all(db.APPL_DB, k)
 
+    def test_parse_openconfig_1_2_0_state_fields(self):
+        parsed = self.daemon.parse_update(self._json)
+
+        eth0 = parsed['eth0']
+        self.assertEqual(eth0['lldp_rem_ttl'], '90')
+        self.assertEqual(eth0['lldp_rem_max_frame_size'], '1514')
+        self.assertEqual(eth0['lldp_rem_port_vlan_id'], '146')
+        self.assertEqual(eth0['lldp_rem_agg_port_id'], '')
+        self.assertEqual(eth0['lldp_rem_med_inv_serial'], '')
+        custom = json.loads(eth0['lldp_rem_custom_tlvs'])
+        self.assertEqual(len(custom), 1)
+        self.assertEqual(custom[0]['type'], 127)
+        self.assertEqual(custom[0]['oui'], '00:90:69')
+        self.assertEqual(custom[0]['oui-subtype'], '1')
+        self.assertEqual(custom[0]['value'], '435530323133353130363530')
+
+        ethernet0 = parsed['Ethernet0']
+        self.assertEqual(ethernet0['lldp_rem_ttl'], '120')
+        self.assertEqual(ethernet0['lldp_rem_max_frame_size'], '9236')
+        self.assertEqual(ethernet0['lldp_rem_port_vlan_id'], '101')
+        self.assertEqual(ethernet0['lldp_rem_custom_tlvs'], '')
+
+        loc = parsed['local-chassis']
+        self.assertEqual(loc['lldp_loc_ttl'], '120')
+        self.assertEqual(loc['lldp_loc_man_addr'], '10.1.0.32,fc00:1::32')
+
+    def test_parse_aggregation_and_med_serial(self):
+        sample = {
+            'lldp': {
+                'interface': [{
+                    'Ethernet0': {
+                        'rid': '1',
+                        'age': '0 day, 00:00:10',
+                        'port': {
+                            'id': {'type': 'ifname', 'value': 'Ethernet1'},
+                            'descr': 'agg member',
+                            'mfs': '9216',
+                            'aggregation': '42',
+                        },
+                        'chassis': {
+                            'peer': {
+                                'id': {'type': 'mac', 'value': '00:11:22:33:44:55'},
+                                'ttl': '120',
+                                'descr': 'peer',
+                            }
+                        },
+                        'lldp-med': {
+                            'inventory': {
+                                'serial': 'SN-1234',
+                            }
+                        },
+                    }
+                }]
+            }
+        }
+        parsed = self.daemon.parse_update(sample)
+        entry = parsed['Ethernet0']
+        self.assertEqual(entry['lldp_rem_agg_port_id'], '42')
+        self.assertEqual(entry['lldp_rem_med_inv_serial'], 'SN-1234')
+        self.assertEqual(entry['lldp_rem_max_frame_size'], '9216')
+        self.assertEqual(entry['lldp_rem_ttl'], '120')
+
     def test_chassis_cache_no_db_calls_when_unchanged(self):
         """
         Test that database operations are not called when chassis data hasn't changed.
@@ -298,3 +379,98 @@ class TestLldpSyncDaemon(TestCase):
             self.assertEqual(len(chassis_deletes), 0)
             self.assertEqual(len(chassis_sets), 0)
             self.assertEqual(self.daemon.chassis_cache, initial_cache)
+
+    def test_parse_statistics(self):
+        parsed = self.daemon.parse_statistics(self._statistics)
+        self.assertIsNotNone(parsed)
+        self.assertNotIn('docker0', parsed)
+
+        eth0 = parsed['eth0']
+        self.assertEqual(eth0['frame_out'], '10')
+        self.assertEqual(eth0['frame_in'], '20')
+        self.assertEqual(eth0['frame_discard'], '1')
+        self.assertEqual(eth0['tlv_unknown'], '2')
+        self.assertEqual(eth0['entries_aged_out'], '3')
+        self.assertEqual(eth0['tlv_accepted'], '4')
+
+        ethernet0 = parsed['Ethernet0']
+        self.assertEqual(ethernet0['frame_out'], '100')
+        self.assertEqual(ethernet0['frame_in'], '200')
+        self.assertEqual(ethernet0['frame_discard'], '6')
+        self.assertEqual(ethernet0['tlv_unknown'], '7')
+        self.assertEqual(ethernet0['entries_aged_out'], '8')
+        self.assertEqual(ethernet0['tlv_accepted'], '9')
+
+        global_stats = parsed['GLOBAL']
+        self.assertEqual(global_stats['frame_out'], '110')
+        self.assertEqual(global_stats['frame_in'], '220')
+        self.assertEqual(global_stats['frame_discard'], '7')
+        self.assertEqual(global_stats['tlv_unknown'], '9')
+        self.assertEqual(global_stats['entries_aged_out'], '11')
+        self.assertEqual(global_stats['tlv_accepted'], '13')
+
+    def test_parse_statistics_summary_only(self):
+        sample = {
+            'lldp': {
+                'summary': {
+                    'tx': '15',
+                    'rx': '25',
+                    'rx_discarded_cnt': '0',
+                    'rx_unrecognized_cnt': '1',
+                    'ageout_cnt': '2',
+                    'insert_cnt': '3',
+                }
+            }
+        }
+        parsed = self.daemon.parse_statistics(sample)
+        self.assertEqual(parsed['GLOBAL']['frame_out'], '15')
+        self.assertEqual(parsed['GLOBAL']['frame_in'], '25')
+        self.assertEqual(parsed['GLOBAL']['tlv_unknown'], '1')
+        self.assertEqual(parsed['GLOBAL']['tlv_accepted'], '3')
+        self.assertEqual(parsed['GLOBAL']['entries_aged_out'], '2')
+        self.assertEqual(list(parsed.keys()), ['GLOBAL'])
+
+    def test_parse_update_does_not_mix_statistics_into_neighbors(self):
+        payload = json.loads(json.dumps(self._json))
+        payload['lldp_statistics'] = self._statistics
+        parsed = self.daemon.parse_update(payload)
+        self.assertNotIn('GLOBAL', parsed)
+        self.assertNotIn('frame_in', parsed['Ethernet0'])
+        self.assertIsNotNone(self.daemon._pending_statistics)
+        self.assertIn('GLOBAL', self.daemon._pending_statistics)
+
+    def test_sync_statistics_roundtrip(self):
+        payload = json.loads(json.dumps(self._json))
+        payload['lldp_statistics'] = self._statistics
+        parsed_update = self.daemon.parse_update(payload)
+        self.daemon.sync(parsed_update)
+
+        db = self.daemon.db_connector
+        eth0 = db.get_all(db.COUNTERS_DB, 'LLDP_STATISTICS:eth0')
+        ethernet0 = db.get_all(db.COUNTERS_DB, 'LLDP_STATISTICS:Ethernet0')
+        global_stats = db.get_all(db.COUNTERS_DB, 'LLDP_STATISTICS:GLOBAL')
+
+        self.assertEqual(eth0['frame_in'], '20')
+        self.assertEqual(ethernet0['frame_out'], '100')
+        self.assertEqual(global_stats['frame_in'], '220')
+        self.assertFalse(db.exists(db.COUNTERS_DB, 'LLDP_STATISTICS:docker0'))
+
+        # Neighbor APPL_DB keys are unchanged by the counters write.
+        appl_keys = db.keys(db.APPL_DB)
+        self.assertTrue(any(k.startswith(TABLE_PREFIX) for k in appl_keys))
+        self.assertFalse(any(k.startswith('LLDP_STATISTICS:') for k in appl_keys))
+
+    def test_sync_statistics_deletes_stale_interface(self):
+        first = self.daemon.parse_statistics(self._statistics)
+        self.daemon.sync_statistics(first)
+        db = self.daemon.db_connector
+        self.assertTrue(db.exists(db.COUNTERS_DB, 'LLDP_STATISTICS:eth0'))
+
+        second = {
+            'Ethernet0': first['Ethernet0'],
+            'GLOBAL': first['Ethernet0'],
+        }
+        self.daemon.sync_statistics(second)
+        self.assertFalse(db.exists(db.COUNTERS_DB, 'LLDP_STATISTICS:eth0'))
+        self.assertTrue(db.exists(db.COUNTERS_DB, 'LLDP_STATISTICS:Ethernet0'))
+        self.assertTrue(db.exists(db.COUNTERS_DB, 'LLDP_STATISTICS:GLOBAL'))

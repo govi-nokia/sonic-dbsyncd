@@ -66,6 +66,9 @@ class SwssSyncClient(mockredis.MockRedis):
                     for k, v in table.items():
                         self.hset(h, k, v)
 
+        # COUNTERS_DB (id 2) starts empty; LLDP_STATISTICS hashes are written
+        # by LldpSyncDaemon.sync_statistics() during tests.
+
     # Patch mockredis/mockredis/client.py
     # The offical implementation assume decode_responses=False
     # Here we detect the option and decode after doing encode
@@ -103,56 +106,63 @@ class SwssSyncClient(mockredis.MockRedis):
 class MockConnector(object):
     APPL_DB = 0
     CONFIG_DB = 4
+    COUNTERS_DB = 2
     data = {}
 
     def __init__(self):
         pass
 
+    def _store(self, db_id):
+        if db_id not in MockConnector.data:
+            MockConnector.data[db_id] = {}
+        return MockConnector.data[db_id]
+
     def connect(self, db_id):
+        store = self._store(db_id)
         if db_id == 0:
             with open(INPUT_DIR + '/LLDP_ENTRY_TABLE.json') as f:
                 db = json.load(f)
                 for h, table in db.items():
-                    self.data[h] = {}
+                    store[h] = {}
                     for k, v in table.items():
-                        self.data[h][k] = v
+                        store[h][k] = v
 
         elif db_id == 4:
             with open(INPUT_DIR + '/CONFIG_DB.json') as f:
                 db = json.load(f)
                 for h, table in db.items():
-                    self.data[h] = {}
+                    store[h] = {}
                     for k, v in table.items():
-                        self.data[h][k] = v
+                        store[h][k] = v
 
+        # COUNTERS_DB (id 2) starts empty; LLDP_STATISTICS hashes are written
+        # by LldpSyncDaemon.sync_statistics() during tests.
 
     def get(self, db_id, key, field):
-        return MockConnector.data[key][field]
+        return self._store(db_id)[key][field]
 
     def keys(self, db_id):
-        ret = []
-        for key in MockConnector.data.keys():
-            ret.append(key)
-
-        return ret
+        return list(self._store(db_id).keys())
 
     def get_all(self, db_id, key):
-        return MockConnector.data[key]
+        return self._store(db_id)[key]
 
     def exists(self, db_id, key):
-        return key in MockConnector.data
+        return key in self._store(db_id)
 
     def set(self, db_id, key, field, value, blocking=False):
-        self.data[key] = {}
-        self.data[key][field] = value
+        store = self._store(db_id)
+        store[key] = {}
+        store[key][field] = value
 
     def hmset(self, db_id, key, fieldsvalues):
-        self.data[key] = {}
-        for field,value in fieldsvalues.items():
-            self.data[key][field] = value
+        store = self._store(db_id)
+        store[key] = {}
+        for field, value in fieldsvalues.items():
+            store[key][field] = value
 
     def delete(self, db_id, key):
-        del self.data[key]
+        del self._store(db_id)[key]
 
 
 DBInterface._subscribe_keyspace_notification = _subscribe_keyspace_notification
